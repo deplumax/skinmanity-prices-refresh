@@ -1,0 +1,58 @@
+name: Refresh PriceEmpire prices
+
+# Pulls all-market prices from PriceEmpire (via the Cloudflare Worker proxy /pe-bulk)
+# and writes them back through the Worker (/pe-upsert) into Supabase. No Supabase or
+# PriceEmpire credentials needed here — only the shared Worker token.
+#
+# This lives in a PUBLIC repo on purpose: GitHub Actions minutes are free/unlimited
+# for public repos, so the long-running loop (runner sleeps 20 min between refreshes)
+# costs nothing. In the private app repo the same pattern burned the whole 2,000-min
+# monthly quota in ~1.5 days (July 2026).
+#
+# Required repo secret:
+#   PE_PROXY_TOKEN — shared token for the Worker's /pe-bulk and /pe-upsert endpoints
+
+on:
+  schedule:
+    # Sparse cron — GitHub throttles frequent schedules ('*/20' fired only ~8-10×/day).
+    # A 2-hour cron fires reliably; the script loops 6 refreshes × 20 min per run.
+    - cron: '0 */2 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: refresh
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # keepalive empty commit (see last step)
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Refresh prices
+        env:
+          PE_PROXY_TOKEN: ${{ secrets.PE_PROXY_TOKEN }}
+          # schedule: loop 6 refreshes 20 min apart (fills the 2h window);
+          # manual dispatch: single quick refresh
+          REFRESH_ITERATIONS: ${{ github.event_name == 'schedule' && '6' || '1' }}
+          REFRESH_INTERVAL_MIN: '20'
+        run: node scripts/refresh-pricempire.mjs
+      # GitHub auto-disables scheduled workflows after 60 days without repo activity.
+      # Push an empty commit when the last commit is >45 days old to reset that timer.
+      - name: Keepalive
+        if: github.event_name == 'schedule'
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          if [ $(( (NOW - LAST) / 86400 )) -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: reset scheduled-workflow inactivity timer"
+            git push
+          fi
