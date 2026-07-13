@@ -19,10 +19,6 @@ on:
     - cron: '0 */2 * * *'
   workflow_dispatch: {}
 
-concurrency:
-  group: refresh
-  cancel-in-progress: true
-
 permissions:
   contents: write   # keepalive empty commit (see last step)
 
