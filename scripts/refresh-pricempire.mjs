@@ -105,10 +105,12 @@ function chunk(arr, n) {
 async function fetchPricesBatch(sources, attempt = 1) {
   const csv = sources.join(',');
   const url = USE_PROXY
-    ? `${PROXY_URL}?t=${encodeURIComponent(PROXY_TOKEN)}&sources=${encodeURIComponent(csv)}`
+    ? `${PROXY_URL}?sources=${encodeURIComponent(csv)}`
     : `${HOST}/v4/paid/items/prices?app_id=${APP_ID}&currency=USD&sources=${csv}`;
+  // Proxy token travels in a header, never the query string — query strings end up in
+  // Cloudflare request logs and in any error text that echoes the URL.
   const headers = USE_PROXY
-    ? { Accept: 'application/json', 'Accept-Encoding': 'gzip, br' }
+    ? { Accept: 'application/json', 'Accept-Encoding': 'gzip, br', 'X-PE-Token': PROXY_TOKEN }
     : { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json', 'Accept-Encoding': 'gzip, br' };
   try {
     // Payload is huge (~32 MB) and the Worker proxy can be slow to stream it back;
@@ -209,9 +211,9 @@ function buildRows(master) {
 
 async function upsertChunkViaWorker(part, attempt = 1) {
   try {
-    const r = await fetch(`${UPSERT_URL}?t=${encodeURIComponent(PROXY_TOKEN)}`, {
+    const r = await fetch(UPSERT_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-PE-Token': PROXY_TOKEN },
       body: JSON.stringify(part),
       signal: AbortSignal.timeout(60000),
     });
