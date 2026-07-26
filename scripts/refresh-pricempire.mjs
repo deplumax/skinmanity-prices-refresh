@@ -111,7 +111,9 @@ async function fetchPricesBatch(sources, attempt = 1) {
     ? { Accept: 'application/json', 'Accept-Encoding': 'gzip, br' }
     : { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json', 'Accept-Encoding': 'gzip, br' };
   try {
-    const r = await fetch(url, { headers, signal: AbortSignal.timeout(120000) });
+    // Payload is huge (~32 MB) and the Worker proxy can be slow to stream it back;
+    // 120s was too tight and tripped false timeouts under load.
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(180000) });
     if (!r.ok) {
       const body = await r.text().catch(() => '');
       throw new Error(`HTTP ${r.status}: ${body.slice(0, 300)}`);
@@ -120,9 +122,11 @@ async function fetchPricesBatch(sources, attempt = 1) {
     if (!Array.isArray(data)) throw new Error('unexpected response shape (not an array)');
     return data;
   } catch (e) {
-    if (attempt < 3) {
+    // Transient upstream hiccups (Cloudflare 502, timeouts) are common on the big
+    // batch — retry more times with longer backoff before giving up.
+    if (attempt < 5) {
       console.warn(`  batch retry ${attempt} after error: ${e.message}`);
-      await new Promise(res => setTimeout(res, 2000 * attempt));
+      await new Promise(res => setTimeout(res, 3000 * attempt));
       return fetchPricesBatch(sources, attempt + 1);
     }
     throw e;
@@ -307,17 +311,25 @@ const INTERVAL_MIN = Math.max(1, Number(process.env.REFRESH_INTERVAL_MIN || '20'
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 (async () => {
+  let anySuccess = false;
   for (let iter = 1; iter <= ITERATIONS; iter++) {
     if (ITERATIONS > 1) console.log(`\n=== refresh iteration ${iter}/${ITERATIONS} ===`);
     try {
       await main();
+      anySuccess = true;
     } catch (e) {
       console.error('FATAL:', e.message);
-      if (iter === ITERATIONS) process.exit(1); // last iteration failed → mark run failed
     }
     if (iter < ITERATIONS) {
       console.log(`sleeping ${INTERVAL_MIN} min before next refresh…`);
       await sleep(INTERVAL_MIN * 60 * 1000);
     }
+  }
+  // Only fail the whole run if EVERY iteration failed. A single transient upstream
+  // hiccup (Cloudflare 502/timeout) on one iteration — even the last — should not
+  // mark the run failed when other iterations already wrote fresh prices.
+  if (!anySuccess) {
+    console.error('All refresh iterations failed — marking run as failed.');
+    process.exit(1);
   }
 })();
