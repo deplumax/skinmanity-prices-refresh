@@ -209,6 +209,11 @@ function buildRows(master) {
   return rows;
 }
 
+// The Worker sanitises what it is sent — junk market prices are dropped, a row left with
+// no usable price is skipped — and reports the counts. Accumulate them so that sanitising
+// shows up in the run log instead of happening invisibly.
+const upsertStats = { skipped: 0, droppedPrices: 0 };
+
 async function upsertChunkViaWorker(part, attempt = 1) {
   try {
     const r = await fetch(UPSERT_URL, {
@@ -219,10 +224,18 @@ async function upsertChunkViaWorker(part, attempt = 1) {
     });
     if (!r.ok) {
       const body = await r.text().catch(() => '');
-      throw new Error(`pe-upsert HTTP ${r.status}: ${body.slice(0, 300)}`);
+      const err = new Error(`pe-upsert HTTP ${r.status}: ${body.slice(0, 300)}`);
+      // 4xx is deterministic — the same body gets rejected again, so don't burn retries.
+      if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) err.noRetry = true;
+      throw err;
+    }
+    const info = await r.json().catch(() => null);
+    if (info) {
+      upsertStats.skipped += info.skipped || 0;
+      upsertStats.droppedPrices += info.dropped_prices || 0;
     }
   } catch (e) {
-    if (attempt < 3) {
+    if (attempt < 3 && !e.noRetry) {
       console.warn(`  upsert retry ${attempt} after error: ${e.message}`);
       await new Promise(res => setTimeout(res, 2000 * attempt));
       return upsertChunkViaWorker(part, attempt + 1);
@@ -234,6 +247,8 @@ async function upsertChunkViaWorker(part, attempt = 1) {
 async function upsertRows(rows) {
   const CHUNK = 500;
   let written = 0;
+  upsertStats.skipped = 0;
+  upsertStats.droppedPrices = 0;
   if (SERVICE_KEY) {
     // Direct Supabase path (local runs with the service key).
     const { createClient } = await import('@supabase/supabase-js');
@@ -253,6 +268,9 @@ async function upsertRows(rows) {
     }
   }
   process.stdout.write('\n');
+  if (upsertStats.skipped || upsertStats.droppedPrices) {
+    console.log(`  worker sanitised: dropped ${upsertStats.droppedPrices} bad market prices, skipped ${upsertStats.skipped} rows left with none`);
+  }
 }
 
 async function main() {
