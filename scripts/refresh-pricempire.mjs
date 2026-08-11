@@ -118,12 +118,24 @@ async function fetchPricesBatch(sources, attempt = 1) {
     const r = await fetch(url, { headers, signal: AbortSignal.timeout(180000) });
     if (!r.ok) {
       const body = await r.text().catch(() => '');
-      throw new Error(`HTTP ${r.status}: ${body.slice(0, 300)}`);
+      const err = new Error(`HTTP ${r.status}: ${body.slice(0, 300)}`);
+      // A blown PriceEmpire quota is fatal until the window resets — retrying cannot
+      // fix it, and every attempt is another request against the very budget that ran
+      // out. Before this check the job spent ~1,000 requests/day hammering the wall
+      // (5 attempts × 3 batches × 6 iterations × 12 runs) and burned 1h44m of runner
+      // time per run doing it (August 2026). Mark it so the loop stops for good.
+      if (r.status === 429 && /limit_exceeded/i.test(body)) {
+        err.quotaExhausted = true;
+        const reset = Number(body.match(/"reset":\s*(\d+)/)?.[1]);
+        if (Number.isFinite(reset)) err.resetAt = new Date(reset * 1000).toISOString();
+      }
+      throw err;
     }
     const data = await r.json();
     if (!Array.isArray(data)) throw new Error('unexpected response shape (not an array)');
     return data;
   } catch (e) {
+    if (e.quotaExhausted) throw e;
     // Transient upstream hiccups (Cloudflare 502, timeouts) are common on the big
     // batch — retry more times with longer backoff before giving up.
     if (attempt < 5) {
@@ -325,13 +337,24 @@ async function main() {
 // 72×), which left ~98% of the PriceEmpire quota unused. So the workflow now
 // fires a SPARSE cron (every 2h — those run reliably) and this script refreshes
 // several times within one run: REFRESH_ITERATIONS iterations, sleeping
-// REFRESH_INTERVAL_MIN between them. 6 × every 2h × 3 req = ~6,500 req/month.
+// REFRESH_INTERVAL_MIN between them.
+//
+// BUDGET — this job is not the only thing spending the PriceEmpire quota. The Worker's
+// /inventory route shares the same key, and unlike this job that cost grows with the
+// user base. So this job must take the SMALLER, fixed share and leave the rest to it:
+//   requests/month = 12 cron runs/day × ITERATIONS × 3 batches × 30
+//   6 iterations (20 min apart) = ~6,500/mo — 65% of a 10k plan. This is what blew the
+//     quota on 2026-08-09: nothing was left for user traffic and prices froze for 6 days.
+//   3 iterations (40 min apart) = ~3,240/mo — the current setting.
+// Raise ITERATIONS only against a measured user-traffic number (the Worker's pe-usage
+// counter), never against the plan limit alone.
 const ITERATIONS = Math.max(1, Number(process.env.REFRESH_ITERATIONS || '1'));
 const INTERVAL_MIN = Math.max(1, Number(process.env.REFRESH_INTERVAL_MIN || '20'));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 (async () => {
   let anySuccess = false;
+  let quotaExhausted = false;
   for (let iter = 1; iter <= ITERATIONS; iter++) {
     if (ITERATIONS > 1) console.log(`\n=== refresh iteration ${iter}/${ITERATIONS} ===`);
     try {
@@ -339,6 +362,14 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       anySuccess = true;
     } catch (e) {
       console.error('FATAL:', e.message);
+      // Out of PriceEmpire quota: every remaining iteration would fail identically and
+      // cost more requests. Stop the whole run — the next cron fires in 2h anyway, and
+      // once the window resets it picks up on its own with no manual step.
+      if (e.quotaExhausted) {
+        console.error(`PriceEmpire quota exhausted${e.resetAt ? ` — resets ${e.resetAt}` : ''}. Aborting the remaining ${ITERATIONS - iter} iteration(s).`);
+        quotaExhausted = true;
+        break;
+      }
     }
     if (iter < ITERATIONS) {
       console.log(`sleeping ${INTERVAL_MIN} min before next refresh…`);
@@ -349,7 +380,9 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   // hiccup (Cloudflare 502/timeout) on one iteration — even the last — should not
   // mark the run failed when other iterations already wrote fresh prices.
   if (!anySuccess) {
-    console.error('All refresh iterations failed — marking run as failed.');
+    console.error(quotaExhausted
+      ? 'No prices written — PriceEmpire quota exhausted. Marking run as failed.'
+      : 'All refresh iterations failed — marking run as failed.');
     process.exit(1);
   }
 })();

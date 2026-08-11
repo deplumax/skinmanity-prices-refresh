@@ -15,7 +15,7 @@ name: Refresh PriceEmpire prices
 on:
   schedule:
     # Sparse cron — GitHub throttles frequent schedules ('*/20' fired only ~8-10×/day).
-    # A 2-hour cron fires reliably; the script loops 6 refreshes × 20 min per run.
+    # A 2-hour cron fires reliably; the script loops 3 refreshes × 40 min per run.
     - cron: '0 */2 * * *'
   workflow_dispatch: {}
 
@@ -34,10 +34,15 @@ jobs:
       - name: Refresh prices
         env:
           PE_PROXY_TOKEN: ${{ secrets.PE_PROXY_TOKEN }}
-          # schedule: loop 6 refreshes 20 min apart (fills the 2h window);
+          # schedule: loop 3 refreshes 40 min apart (fills the 2h window; ~3,240
+          # req/month — down from 6×20min/~6,500 which blew the 10k monthly
+          # PriceEmpire quota on 2026-08-09 and froze prices for 6 days, because
+          # this job was never the only caller: the Worker's /inventory route
+          # shares the same key and that cost grows with the user base.
+          # See scripts/refresh-pricempire.mjs for the full budget math);
           # manual dispatch: single quick refresh
-          REFRESH_ITERATIONS: ${{ github.event_name == 'schedule' && '6' || '1' }}
-          REFRESH_INTERVAL_MIN: '20'
+          REFRESH_ITERATIONS: ${{ github.event_name == 'schedule' && '3' || '1' }}
+          REFRESH_INTERVAL_MIN: '40'
         run: node scripts/refresh-pricempire.mjs
       # GitHub auto-disables scheduled workflows after 60 days without repo activity.
       # Push an empty commit when the last commit is >45 days old to reset that timer.
