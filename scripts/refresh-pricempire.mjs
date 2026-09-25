@@ -57,7 +57,6 @@ const MARKETS = [
   { pe: 'waxpeer',    key: 'waxpeer' },
   { pe: 'tradeit',    key: 'tradeit' },
   { pe: 'csmoney',    key: 'csmoney' },
-  { pe: 'gamerpay',   key: 'gamerpay' },
   { pe: 'shadowpay',  key: 'shadowpay' },
   { pe: 'lisskins',   key: 'lisskins' },
   { pe: 'marketcsgo', key: 'marketcsgo' },
@@ -90,8 +89,15 @@ const MARKETS = [
   { pe: 'skinvault',   key: 'skinvault' },
   { pe: 'gameboost',   key: 'gameboost' },
   { pe: '49skins',     key: '49skins' },
+  // Added Sep 2026 — both appear in PriceEmpire's current /v4/paid/items/prices source list
+  // (the 61-key list probed in June predates them). Batch 3 goes 12 → 14 sources, still under
+  // the 15 cap, so this costs no extra requests against the monthly quota.
+  // pirateswap gives its affiliate link (+$30 bonus badge) a real SELL ON price for the first time.
+  { pe: 'skinland',    key: 'skinland' },
+  { pe: 'pirateswap',  key: 'pirateswap' },
 ];
 // Dropped (negligible coverage, <1k of 37k items): nerf (24), krakatoa (403), skinthunder (895).
+// Dropped Sep 2026: gamerpay — GamerPay shut down; its last listings would linger as stale prices.
 
 const BATCH_SIZE = 15; // PriceEmpire hard limit
 const PE_TO_APP = new Map(MARKETS.map(m => [m.pe, m.key]));
@@ -205,8 +211,13 @@ function buildRows(master) {
     const entries = Object.entries(rec.prices);
     if (!entries.length) continue;
     // best = cheapest market (convenience default; the app computes its own display).
-    let best = entries[0];
-    for (const e of entries) if (e[1] < best[1]) best = e;
+    // pirateswap never counts as best: its listed price understates the real cost (big
+    // checkout fee) and best_price feeds the server-side inventory valuation. Same rule as
+    // the worker's /pe-upsert, which recomputes best_* anyway.
+    const pool = entries.filter(([k]) => k !== 'pirateswap');
+    const cands = pool.length ? pool : entries;
+    let best = cands[0];
+    for (const e of cands) if (e[1] < best[1]) best = e;
     rows.push({
       name,
       prices: rec.prices,
