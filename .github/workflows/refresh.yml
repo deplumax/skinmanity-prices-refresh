@@ -17,7 +17,12 @@ on:
     # Sparse cron — GitHub throttles frequent schedules ('*/20' fired only ~8-10×/day).
     # A 2-hour cron fires reliably; the script loops 3 refreshes × 40 min per run.
     - cron: '0 */2 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      only_dota:
+        description: 'Only refresh Dota 2 prices (skip CS2 — saves 3 PriceEmpire requests)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # keepalive empty commit (see last step)
@@ -32,6 +37,7 @@ jobs:
         with:
           node-version: '22'
       - name: Refresh prices
+        if: ${{ !inputs.only_dota }}
         env:
           PE_PROXY_TOKEN: ${{ secrets.PE_PROXY_TOKEN }}
           # schedule: loop 3 refreshes 40 min apart (fills the 2h window; ~3,240
@@ -44,6 +50,15 @@ jobs:
           REFRESH_ITERATIONS: ${{ github.event_name == 'schedule' && '3' || '1' }}
           REFRESH_INTERVAL_MIN: '40'
         run: node scripts/refresh-pricempire.mjs
+      # Dota 2 (Oct 2026): one PriceEmpire request per run, written to dota_market_prices via
+      # the Worker's /pe-upsert?game=dota2. Runs once per cron fire (not looped like CS2):
+      # 12 runs/day ≈ 360 requests/month. Runs even if the CS2 step failed — the two tables
+      # are independent and a CS2 hiccup must not freeze Dota prices too.
+      - name: Refresh Dota 2 prices
+        if: ${{ !cancelled() }}
+        env:
+          PE_PROXY_TOKEN: ${{ secrets.PE_PROXY_TOKEN }}
+        run: node scripts/refresh-pricempire.mjs --game dota2
       # GitHub auto-disables scheduled workflows after 60 days without repo activity.
       # Push an empty commit when the last commit is >45 days old to reset that timer.
       - name: Keepalive

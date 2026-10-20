@@ -28,7 +28,15 @@ const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const DRY_RUN = process.argv.includes('--dry-run');
 
 const HOST = 'https://api.pricempire.com';
-const APP_ID = 730;
+// `--game dota2` (or GAME=dota2) refreshes the Dota 2 table instead (Oct 2026). Same job,
+// same proxy, same row shape — only the app id, the market list and the target table differ.
+// ONE PriceEmpire request per run (the Dota list fits one 15-source batch), so running it once
+// per 2h cron costs ~360 requests/month of the 10k budget. Do not loop it like CS2.
+const GAME = (process.argv.find(a => a.startsWith('--game='))?.split('=')[1]
+  || (process.argv.includes('--game') ? process.argv[process.argv.indexOf('--game') + 1] : '')
+  || process.env.GAME || 'cs2').toLowerCase();
+const IS_DOTA = GAME === 'dota2';
+const APP_ID = IS_DOTA ? 570 : 730;
 
 // By default the script fetches through the Cloudflare Worker proxy (/pe-bulk) so the
 // PriceEmpire key stays ONLY in the Worker secret — nothing to paste locally or in CI.
@@ -40,14 +48,14 @@ const PROXY_TOKEN = process.env.PE_PROXY_TOKEN || '';
 const USE_PROXY = !API_KEY; // proxy unless an explicit key is provided
 // Writes go through the Worker too (/pe-upsert, same token) unless a Supabase
 // service key is provided — so CI needs NO Supabase credentials at all.
-const UPSERT_URL = process.env.PE_UPSERT_URL || PROXY_URL.replace(/\/pe-bulk$/, '/pe-upsert');
+const UPSERT_URL = (process.env.PE_UPSERT_URL || PROXY_URL.replace(/\/pe-bulk$/, '/pe-upsert')) + (IS_DOTA ? '?game=dota2' : '');
 
 // Curated markets to publish (~45). Each: { pe: PriceEmpire provider_key, key: app allPrices key }.
 // PriceEmpire allows max 15 sources per request, so these are fetched in 3 batches.
 // Mapping is 1:1 except whitemarket → whitemarekt (the app's historical key spelling).
 // Gambling sites (csgoempire/csgoroll/clashgg) are intentionally excluded — Apple bans
 // gambling links from iOS apps, so we don't surface their prices.
-const MARKETS = [
+const CS2_MARKETS = [
   // ── batch 1 ──
   { pe: 'steam',      key: 'steam' },
   { pe: 'csfloat',    key: 'csfloat' },
@@ -95,9 +103,29 @@ const MARKETS = [
   // pirateswap gives its affiliate link (+$30 bonus badge) a real SELL ON price for the first time.
   { pe: 'skinland',    key: 'skinland' },
   { pe: 'pirateswap',  key: 'pirateswap' },
+  // Added Oct 2026 — Skins.com (0% fee market, same company as PriceEmpire; its own API is a
+  // trading API with no bulk price list, so PriceEmpire's `skins` source is how it is
+  // priced). 41 markets = still 3 requests (15/15/11), no extra quota.
+  { pe: 'skins',       key: 'skins' },
 ];
 // Dropped (negligible coverage, <1k of 37k items): nerf (24), krakatoa (403), skinthunder (895).
 // Dropped Sep 2026: gamerpay — GamerPay shut down; its last listings would linger as stale prices.
+
+// Dota 2 markets (owner's list from PriceEmpire's Dota market filter, Oct 2026). SIH.Market
+// is on that list too but has no PriceEmpire source key — it is a link-only market in the app.
+const DOTA_MARKETS = [
+  { pe: 'steam',      key: 'steam' },
+  { pe: 'lisskins',   key: 'lisskins' },
+  { pe: 'marketcsgo', key: 'marketcsgo' },   // market.dota2.net — same company, own domain
+  { pe: 'tradeit',    key: 'tradeit' },
+  { pe: 'dmarket',    key: 'dmarket' },
+  { pe: 'cstrade',    key: 'cstrade' },
+  { pe: 'lootfarm',   key: 'lootfarm' },
+  { pe: 'mannco',     key: 'mannco' },
+  { pe: 'skinport',   key: 'skinport' },
+  { pe: 'avanmarket', key: 'avanmarket' },
+];
+const MARKETS = IS_DOTA ? DOTA_MARKETS : CS2_MARKETS;
 
 const BATCH_SIZE = 15; // PriceEmpire hard limit
 const PE_TO_APP = new Map(MARKETS.map(m => [m.pe, m.key]));
@@ -111,7 +139,7 @@ function chunk(arr, n) {
 async function fetchPricesBatch(sources, attempt = 1) {
   const csv = sources.join(',');
   const url = USE_PROXY
-    ? `${PROXY_URL}?sources=${encodeURIComponent(csv)}`
+    ? `${PROXY_URL}?sources=${encodeURIComponent(csv)}${IS_DOTA ? `&app_id=${APP_ID}` : ''}`
     : `${HOST}/v4/paid/items/prices?app_id=${APP_ID}&currency=USD&sources=${csv}`;
   // Proxy token travels in a header, never the query string — query strings end up in
   // Cloudflare request logs and in any error text that echoes the URL.
@@ -277,7 +305,7 @@ async function upsertRows(rows) {
     const { createClient } = await import('@supabase/supabase-js');
     const supabase = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
     for (const part of chunk(rows, CHUNK)) {
-      const { error } = await supabase.from('skin_market_prices').upsert(part, { onConflict: 'name' });
+      const { error } = await supabase.from(IS_DOTA ? 'dota_market_prices' : 'skin_market_prices').upsert(part, { onConflict: 'name' });
       if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
       written += part.length;
       process.stdout.write(`\r  upserted ${written}/${rows.length}`);
@@ -305,14 +333,14 @@ async function main() {
   if (!DRY_RUN && !SERVICE_KEY && !PROXY_TOKEN) { console.error('ERROR: need SUPABASE_SERVICE_ROLE_KEY or PE_PROXY_TOKEN to write (or pass --dry-run)'); process.exit(1); }
 
   let rows;
-  if (process.env.PE_FALLBACK === 'csmoney') {
+  if (process.env.PE_FALLBACK === 'csmoney' && !IS_DOTA) {
     // PriceEmpire disabled → fall back to CS.Money's own API.
     console.log('PE_FALLBACK=csmoney → fetching prices from CS.Money API instead of PriceEmpire');
     rows = await fetchCSMoneyFallback();
     console.log(`CS.Money fallback: ${rows.length} items`);
   } else {
     const batches = chunk(MARKETS.map(m => m.pe), BATCH_SIZE);
-    console.log(`PriceEmpire refresh — ${MARKETS.length} markets in ${batches.length} batches${DRY_RUN ? ' (dry run)' : ''} via ${USE_PROXY ? 'Worker proxy (no local key)' : 'direct API key'}`);
+    console.log(`PriceEmpire refresh [${IS_DOTA ? 'Dota 2' : 'CS2'}] — ${MARKETS.length} markets in ${batches.length} batches${DRY_RUN ? ' (dry run)' : ''} via ${USE_PROXY ? 'Worker proxy (no local key)' : 'direct API key'}`);
     const master = new Map();
     for (let i = 0; i < batches.length; i++) {
       const t0 = Date.now();
@@ -332,7 +360,7 @@ async function main() {
   for (const [k, n] of covSorted) console.log(`  ${k.padEnd(14)} ${n}`);
 
   if (DRY_RUN) {
-    const sample = rows.find(r => r.name.includes('AK-47 | Redline (Field-Tested)')) || rows[0];
+    const sample = rows.find(r => r.name.includes(IS_DOTA ? 'Dragonclaw Hook' : 'AK-47 | Redline (Field-Tested)')) || rows[0];
     console.log('\nsample row:', JSON.stringify(sample, null, 2));
     console.log('\n--dry-run: nothing written to Supabase');
     return;
@@ -359,7 +387,8 @@ async function main() {
 //   3 iterations (40 min apart) = ~3,240/mo — the current setting.
 // Raise ITERATIONS only against a measured user-traffic number (the Worker's pe-usage
 // counter), never against the plan limit alone.
-const ITERATIONS = Math.max(1, Number(process.env.REFRESH_ITERATIONS || '1'));
+// Dota: always one pass, whatever the workflow passes (see the IS_DOTA note at the top).
+const ITERATIONS = IS_DOTA ? 1 : Math.max(1, Number(process.env.REFRESH_ITERATIONS || '1'));
 const INTERVAL_MIN = Math.max(1, Number(process.env.REFRESH_INTERVAL_MIN || '20'));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
