@@ -212,6 +212,32 @@ async function fetchCSMoneyFallback() {
   }));
 }
 
+// SkinSell.gg (owner, Nov 16 2026; partner, public endpoints, no key): the lowest listing per
+// item, USD. Merged as `skinsell` into the items PriceEmpire already returned — never a row of
+// its own. Doppler phases come as separate entries of one name: the cheapest phase is kept,
+// like PriceEmpire's own phase-less price. Their buyout prices (instant sell) are a separate
+// endpoint, not used yet. A failed fetch only means no SkinSell prices this run.
+const SKINSELL_PRICES = 'https://skinsell.gg/api/store/public/prices';
+async function mergeSkinSell(master) {
+  try {
+    const r = await fetch(SKINSELL_PRICES, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(90000) });
+    if (!r.ok) { console.warn(`skinsell → HTTP ${r.status}`); return 0; }
+    const list = await r.json();
+    let n = 0;
+    for (const it of Array.isArray(list) ? list : []) {
+      if (Number(it?.appid) !== APP_ID) continue;
+      const rec = master.get(it.market_hash_name);
+      const usd = Math.round(Number(it.min_price) * 100) / 100;
+      if (!rec || !(usd > 0)) continue;
+      if (rec.prices.skinsell == null) n++;
+      if (rec.prices.skinsell == null || usd < rec.prices.skinsell) rec.prices.skinsell = usd;
+      const c = Number(it.total) || 0;
+      if (c > 0) rec.counts.skinsell = Math.max(rec.counts.skinsell || 0, c);
+    }
+    return n;
+  } catch (e) { console.warn(`skinsell failed: ${e.message}`); return 0; }
+}
+
 /** master: Map<name, { prices: {appKey:usd}, counts: {appKey:n}, liquidity:number }> */
 function mergeBatch(master, items) {
   for (const it of items) {
@@ -348,6 +374,7 @@ async function main() {
       mergeBatch(master, items);
       console.log(`  batch ${i + 1}/${batches.length}: ${items.length} items, ${batches[i].length} sources, ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     }
+    if (!IS_DOTA) console.log(`  skinsell: ${await mergeSkinSell(master)} items priced`);
     rows = buildRows(master);
   }
   console.log(`parsed ${rows.length} items with at least one market price`);
